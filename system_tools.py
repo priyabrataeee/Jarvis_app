@@ -19,6 +19,28 @@ SAFE_VERBS = {
 SAFE_CMDLETS = {"out-string", "write-output"}
 # Open an app, file or folder, like double-clicking it
 LAUNCHERS = {"start-process", "invoke-item", "ii", "explorer"}
+LAUNCHER_FLAGS = {"-filepath", "-path", "-literalpath"}
+# Apps that may be opened by name without confirmation; any other program could do anything
+SAFE_APPS = {
+    "notepad", "calc", "mspaint", "wordpad", "explorer", "taskmgr", "snippingtool",
+    "chrome", "msedge", "firefox", "code", "winword", "excel", "powerpnt", "outlook", "onenote",
+}
+# Files that open in a viewer or editor. Anything else (programs, shortcuts, scripts, macro
+# documents, unknown types) could run code when opened, so it needs confirmation.
+SAFE_OPEN_EXT = {
+    "pdf", "txt", "md", "csv", "log", "docx", "xlsx", "pptx", "odt", "ods", "odp",
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "heic",
+    "mp3", "wav", "m4a", "flac", "mp4", "mkv", "avi", "mov", "wmv",
+}
+# Reading these could hand passwords, keys or tokens to the model, and from there to a web request.
+# Best effort only: the real guard against leaks is the confirmation for web actions in server.py.
+SENSITIVE = re.compile(
+    r"\\appdata\\|\.ssh\b|\.aws\b|\.azure\b|\.kube\b|\.gnupg\b|\.docker\b|(?<![\w$])env:|\.env\b|"
+    r"id_rsa|id_ed25519|id_ecdsa|\.kdbx\b|\.pem\b|\.pfx\b|\.p12\b|\.key\b|\.ppk\b|config\.json|"
+    r"credential|password|passwd|secret|token|api.?key|wallet|cookies|login data|get-clipboard|\bgcb\b",
+    re.I)
+# Reading file contents with a wildcard could sweep up files nobody named
+CONTENT_READERS = {"get-content", "gc", "cat", "type"}
 # Read-only aliases and native programs
 SAFE_COMMANDS = {
     "ls", "dir", "gci", "gc", "cat", "type", "pwd", "gi", "gp", "gps", "ps",
@@ -36,9 +58,29 @@ MAX_OUTPUT = 3000
 TIMEOUT_SECONDS = 30
 
 
-def _strip_strings(cmd: str) -> str:
-    """Blank out quoted text so paths and search terms aren't mistaken for commands."""
-    return re.sub(r"'[^']*'|\"[^\"]*\"", "''", cmd)
+def _strip_strings(cmd: str) -> tuple[str, list[str]]:
+    """Replace quoted text with numbered placeholders ('0', '1', ...) so paths and search terms
+    aren't mistaken for commands. Also returns the quoted strings, quotes included, in order."""
+    strings = []
+
+    def placeholder(m):
+        strings.append(m.group(0))
+        return f"'{len(strings) - 1}'"
+    return re.sub(r"'[^']*'|\"[^\"]*\"", placeholder, cmd), strings
+
+
+def _launch_target_is_safe(target: str) -> bool:
+    """True for a known app by name, a folder, or a document that opens in a viewer."""
+    target = target.strip().rstrip("\\/")
+    if not target or any(c in target for c in "$*?[@"):
+        return False  # variables, splatting and wildcards could stand for anything
+    if target.startswith(("\\\\", "//")):
+        return False  # network path: opening it sends the Windows login hash to that server
+    name = re.split(r"[\\/]", target)[-1].lower()
+    if not re.search(r"[\\/]", target):
+        return name.removesuffix(".exe") in SAFE_APPS
+    ext = name.rsplit(".", 1)[1] if "." in name else ""
+    return ext == "" or ext in SAFE_OPEN_EXT  # no extension: a folder
 
 
 # Keys allowed in calculated properties: Select-Object @{Name='GB'; Expression={ $_.Size / 1GB }}
@@ -64,6 +106,12 @@ def _braces_are_safe(stripped: str) -> bool:
     return True
 
 
+def _unquote(token: str, strings: list[str]) -> str:
+    """The original text of a token: a placeholder like '0' becomes the quoted string's contents."""
+    m = re.fullmatch(r"'(\d+)'", token)
+    return strings[int(m.group(1))][1:-1] if m else token
+
+
 def _collapse_blocks(stripped: str) -> str:
     """Replace (already checked) script blocks with a placeholder so their ; don't split statements."""
     while _INNERMOST_BLOCK.search(stripped):
@@ -73,10 +121,15 @@ def _collapse_blocks(stripped: str) -> str:
 
 def is_read_only(cmd: str) -> bool:
     """True only if every part of the command is on the read-only allowlist."""
-    stripped = _strip_strings(cmd)
+    if SENSITIVE.search(cmd):
+        return False
+    stripped, strings = _strip_strings(cmd)
 
     # > writes files, :: calls .NET methods, $( and @( run subexpressions, ` escapes, & and . invoke code
     if re.search(r">|::|`|\$\(|@\(", stripped):
+        return False
+    # Double-quoted strings run $(...) subexpressions too, e.g. "C:\$(Remove-Item x)"
+    if any(s.startswith('"') and ("$(" in s or "`" in s) for s in strings):
         return False
     # .Method() calls can change things, e.g. (Get-Item x).Delete()
     if re.search(r"\.\w+\s*\(", stripped):
@@ -94,7 +147,10 @@ def is_read_only(cmd: str) -> bool:
 
     # The first word of each statement and pipeline stage must be an allowed command.
     # Script block contents were fully checked above, so collapse them before splitting.
-    for segment in re.split(r"[;|\n]", _collapse_blocks(stripped)):
+    parts = re.split(r"([;|\n])", _collapse_blocks(stripped))
+    for i in range(0, len(parts), 2):
+        segment = parts[i]
+        piped = i > 0 and parts[i - 1] == "|"  # a later pipeline stage, receiving the previous one's output
         tokens = segment.strip().lstrip("(").split()
         if not tokens:
             continue
@@ -108,9 +164,17 @@ def is_read_only(cmd: str) -> bool:
         head = tokens[0].lower().removesuffix(".exe")
         args = [t.lower() for t in tokens[1:]]
 
+        if any(re.search(r"[*?]", _unquote(a, strings)) for a in args) and head in CONTENT_READERS:
+            return False
         if head in LAUNCHERS:
-            # Just a target: no -ArgumentList, -Verb RunAs etc., and not a script
-            if any(a.startswith("-") and a not in ("-filepath", "-path") for a in args):
+            # Exactly one target and nothing else: no -ArgumentList, -Verb RunAs etc., no second
+            # positional argument (Start-Process passes it to the program), and not fed by a pipeline
+            if piped or any(a.startswith("-") and a not in LAUNCHER_FLAGS for a in args):
+                return False
+            targets = [_unquote(a, strings) for a in args if a not in LAUNCHER_FLAGS]
+            if not targets and head == "explorer":
+                pass  # a bare "explorer" just opens File Explorer
+            elif len(targets) != 1 or not _launch_target_is_safe(targets[0]):
                 return False
             if SCRIPT_EXT.search(cmd):
                 return False
