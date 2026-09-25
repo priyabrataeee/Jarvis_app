@@ -1,142 +1,112 @@
 """
-Jarvis V2 — Browser Tools
-Web search via DuckDuckGo Lite, page visits via Playwright, URL opening.
+Jarvis V2 — Web Tools
+Background web search, page reading and news via plain HTTP requests (no visible browser).
+Opening a URL for the user still uses their default browser.
 """
 
+import asyncio
 import re
 import webbrowser
-import subprocess
-from urllib.parse import unquote, parse_qs, urlparse
+from html import unescape
+from urllib.parse import parse_qs, unquote, urlparse
+
 import httpx
-from playwright.async_api import async_playwright
 
-_browser = None
-_context = None
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+PAGES_TO_READ = 3
+CHARS_PER_PAGE = 2000
+NEWS_FEEDS = {
+    "Google News (India)": "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en",
+    "BBC World": "https://feeds.bbci.co.uk/news/world/rss.xml",
+}
+
+_http = httpx.AsyncClient(timeout=8, follow_redirects=True, headers={"User-Agent": USER_AGENT})
 
 
-def _bring_chromium_to_front():
-    """Bring the Playwright Chromium window to the foreground on Windows."""
+def _strip_html(html: str) -> str:
+    """Readable text from a page: prefer <article>/<main>, drop scripts, menus and markup."""
+    for tag in ("article", "main"):
+        m = re.search(rf"<{tag}\b.*?</{tag}>", html, re.S | re.I)
+        if m and len(m.group(0)) > 1500:
+            html = m.group(0)
+            break
+    html = re.sub(r"<(script|style|noscript|svg|nav|header|footer|form|aside)\b.*?</\1>", " ", html, flags=re.S | re.I)
+    text = unescape(re.sub(r"<[^>]+>", " ", html))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def _read_page(url: str) -> str:
     try:
-        subprocess.run([
-            "powershell", "-Command",
-            '(Get-Process -Name "chromium","chrome" -ErrorAction SilentlyContinue | '
-            'Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -Last 1).MainWindowHandle | '
-            'ForEach-Object { Add-Type "using System; using System.Runtime.InteropServices; '
-            'public class W { [DllImport(\\\"user32.dll\\\")] public static extern bool SetForegroundWindow(IntPtr h); }"; '
-            '[W]::SetForegroundWindow($_) }'
-        ], capture_output=True, timeout=3)
+        r = await _http.get(url)
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+            return ""
+        return _strip_html(r.text)[:CHARS_PER_PAGE]
     except Exception:
-        pass
+        return ""
 
 
-async def _get_browser():
-    global _browser, _context
-    if _browser is None:
-        pw = await async_playwright().start()
-        _browser = await pw.chromium.launch(headless=False, args=["--start-maximized"])
-        _context = await _browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            no_viewport=True,
-        )
-    return _context
-
-
-async def search_and_read(query: str) -> dict:
-    """Search DuckDuckGo in visible browser, click first result, read the page."""
-    ctx = await _get_browser()
-    page = await ctx.new_page()
+async def search_web(query: str) -> str:
+    """Search DuckDuckGo, read the top pages in parallel, and return snippets plus page text."""
     try:
-        # DuckDuckGo search (no cookie banner, no reCAPTCHA)
-        search_url = f"https://duckduckgo.com/?q={query}"
-        await page.goto(search_url, timeout=15000)
-        _bring_chromium_to_front()
-        await page.wait_for_timeout(2000)
-
-        # Click first organic result
-        first_link = page.locator('[data-testid="result-title-a"]').first
-        if await first_link.count() > 0:
-            await first_link.click()
-            await page.wait_for_timeout(3000)
-
-            # Read page content
-            title = await page.title()
-            url = page.url
-            text = await page.evaluate("""
-                () => {
-                    const selectors = ['main', 'article', '[role="main"]', '.content', '#content', 'body'];
-                    for (const sel of selectors) {
-                        const el = document.querySelector(sel);
-                        if (el && el.innerText.trim().length > 100) {
-                            return el.innerText.trim();
-                        }
-                    }
-                    return document.body?.innerText?.trim() || '';
-                }
-            """)
-            return {"title": title, "url": url, "content": text[:3000]}
-        else:
-            return {"title": "Keine Ergebnisse", "url": search_url, "content": "Keine Ergebnisse gefunden."}
+        r = await _http.post("https://html.duckduckgo.com/html/", data={"q": query})
     except Exception as e:
-        return {"error": str(e), "url": query}
-    finally:
-        pass
+        return f"FAILED: search error: {e}"
+
+    # Each result is a title link followed by its snippet; pair each link with the snippet before the next link
+    links = list(re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text, re.S))
+    results = []
+    for i, link in enumerate(links):
+        url = unescape(link.group(1))
+        if "uddg=" in url:  # DuckDuckGo redirect link: the real URL is in the uddg parameter
+            url = unquote(parse_qs(urlparse(url).query)["uddg"][0])
+        if "duckduckgo.com/y.js" in url:  # ads
+            continue
+        section_end = links[i + 1].start() if i + 1 < len(links) else len(r.text)
+        snippet = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', r.text[link.end():section_end], re.S)
+        results.append({
+            "title": _strip_html(link.group(2)),
+            "url": url,
+            "snippet": _strip_html(snippet.group(1)) if snippet else "",
+        })
+        if len(results) == 6:
+            break
+    if not results:
+        return f"FAILED: no search results (HTTP {r.status_code})"
+
+    pages = await asyncio.gather(*(_read_page(res["url"]) for res in results[:PAGES_TO_READ]))
+    out = [f"Web search results for: {query}"]
+    for i, res in enumerate(results):
+        out.append(f"\n[{i + 1}] {res['title']} ({urlparse(res['url']).netloc})\n{res['snippet']}")
+        if i < len(pages) and pages[i]:
+            out.append(f"Page text: {pages[i]}")
+    return "\n".join(out)
 
 
-async def visit(url: str, max_chars: int = 5000) -> dict:
-    """Visit a URL and extract main text content."""
-    ctx = await _get_browser()
-    page = await ctx.new_page()
-    try:
-        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
-        text = await page.evaluate("""
-            () => {
-                const selectors = ['main', 'article', '[role="main"]', '.content', '#content', 'body'];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el && el.innerText.trim().length > 100) {
-                        return el.innerText.trim();
-                    }
-                }
-                return document.body?.innerText?.trim() || '';
-            }
-        """)
-        title = await page.title()
-        return {"title": title, "url": url, "content": text[:max_chars]}
-    except Exception as e:
-        return {"error": str(e), "url": url}
-    finally:
-        await page.close()
+async def visit(url: str) -> dict:
+    """Read a URL's main text in the background."""
+    text = await _read_page(url)
+    if not text:
+        return {"error": "page could not be read", "url": url}
+    return {"title": urlparse(url).netloc, "url": url, "content": text}
 
 
 async def fetch_news() -> str:
-    """Fetch current world news from worldmonitor.app in visible browser."""
-    ctx = await _get_browser()
-    page = await ctx.new_page()
-    try:
-        await page.goto("https://www.worldmonitor.app/", timeout=20000)
-        _bring_chromium_to_front()
-        await page.wait_for_timeout(6000)  # Wait for JS to render
-        text = await page.evaluate("() => document.body.innerText")
-        # Extract the news sections
-        content = text[:4000]
-        return f"World Monitor Nachrichten:\n{content}"
-    except Exception as e:
-        return f"News konnten nicht geladen werden: {e}"
-    finally:
-        pass  # Keep page open so user can see it
+    """Current headlines from RSS feeds."""
+    async def headlines(name, url):
+        try:
+            r = await _http.get(url)
+            titles = re.findall(r"<item>.*?<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", r.text, re.S)
+            return f"{name}:\n" + "\n".join(f"- {unescape(t).strip()}" for t in titles[:12])
+        except Exception:
+            return ""
+    sections = [s for s in await asyncio.gather(*(headlines(n, u) for n, u in NEWS_FEEDS.items())) if s]
+    if not sections:
+        return "FAILED: news could not be loaded"
+    return "Current headlines\n\n" + "\n\n".join(sections)
 
 
 async def open_url(url: str):
     """Open URL in user's default browser (non-blocking)."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, webbrowser.open, url)
+    await asyncio.to_thread(webbrowser.open, url)
     return {"success": True, "url": url}
-
-
-async def close():
-    global _browser, _context
-    if _browser:
-        await _browser.close()
-        _browser = None
-        _context = None

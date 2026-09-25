@@ -1,11 +1,11 @@
 """
 Jarvis V2 — Screen Capture
-Takes screenshots and describes them via Claude Vision.
+Takes screenshots and describes them via Gemini Vision.
 """
 
-import base64
 import io
 from PIL import ImageGrab
+from google.genai import types
 
 
 def capture_screen() -> bytes:
@@ -16,30 +16,20 @@ def capture_screen() -> bytes:
     return buf.getvalue()
 
 
-async def describe_screen(anthropic_client) -> str:
-    """Capture screen and describe it using Claude Vision."""
+async def describe_screen(client, model: str) -> str:
+    """Capture screen and describe it using Gemini Vision."""
     png_bytes = capture_screen()
-    b64 = base64.b64encode(png_bytes).decode("utf-8")
 
-    response = await anthropic_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": b64,
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": "Beschreibe kurz auf Deutsch was auf diesem Bildschirm zu sehen ist. Maximal 2-3 Saetze. Nenne die wichtigsten offenen Programme und Inhalte.",
-                },
-            ],
-        }],
+    response = await client.aio.models.generate_content(
+        model=model,
+        contents=[
+            types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+            "Briefly describe in English what is on this screen. 2-3 sentences at most. Name the main open programs and content.",
+        ],
+        config=types.GenerateContentConfig(
+            max_output_tokens=300,
+            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            http_options=types.HttpOptions(timeout=45_000, retry_options=types.HttpRetryOptions(attempts=2)),
+        ),
     )
-    return response.content[0].text
+    return response.text or ""
