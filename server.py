@@ -414,8 +414,19 @@ async def process_message(session_id: str, user_text: str, ws: WebSocket):
         await speak(ws, session_id, summary)
 
 
+PORT = 8340
+# Browsers let any website open a WebSocket to localhost, so only accept Jarvis's own page:
+# otherwise a web page could send commands (and the spoken "yes") to run code on this computer
+ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    origin = ws.headers.get("origin")
+    if origin not in ALLOWED_ORIGINS:
+        print(f"[jarvis] Rejected connection from origin: {origin}", flush=True)
+        await ws.close(code=1008)
+        return
     await ws.accept()
     session_id = str(id(ws))
     print(f"[jarvis] Client connected", flush=True)
@@ -495,7 +506,7 @@ if __name__ == "__main__":
     import uvicorn
     print("=" * 50, flush=True)
     print("  J.A.R.V.I.S. V2 Server", flush=True)
-    print(f"  http://localhost:8340", flush=True)
+    print(f"  http://localhost:{PORT}", flush=True)
     print("=" * 50, flush=True)
     # Localhost only: Jarvis can run commands on this machine, so it must not be reachable from the network
-    uvicorn.run(app, host="127.0.0.1", port=8340)
+    uvicorn.run(app, host="127.0.0.1", port=PORT)
